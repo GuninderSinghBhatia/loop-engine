@@ -1,0 +1,18 @@
+﻿[project]
+name = "loop-engine"
+version = "0.1.0"
+description = "Self-building loop: plan, build, test and fix a small Python project from one prompt."
+authors = [
+    { name = "GuninderSinghBhatia", email = "guninder.growth@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "anthropic>=2.7.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.4",
+]
+
