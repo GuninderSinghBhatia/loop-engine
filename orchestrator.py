@@ -1,39 +1,30 @@
 import os
-from langchain_groq import ChatGroq
-from dotenv import load_dotenv
-from config import MODELS
 import re
 
+from dotenv import load_dotenv
+from langchain_groq import ChatGroq
+
+from config import MODELS
 from runner import run_pytest, run_ruff
+
 load_dotenv()
 
 MAX_ROUNDS = 3
-
-llm = ChatGroq(
-    model=MODELS['builder'],
-    temperature=0,
-)
-
-query = input("Enter your query : ")
-response = llm.invoke([("system" , "You are a builder agent and you will buid for the user whatever he put the queireis in you"), ("human" , query)])
-result = response.content
+WORKSPACE = "workspace"
 
 
-def extract_code(result: str) -> list[str]:
-    """Return the contents of every ```python block in the reply."""
-    pattern = r"```python[ \t]*\n(.*?)```"
+def extract_code(result: str, lang: str = "python") -> list[str]:
+    """Return the contents of every ```<lang> block in the reply."""
+    pattern = rf"```{re.escape(lang)}[ \t]*\n(.*?)```"
     return [block.strip() for block in re.findall(pattern, result, re.DOTALL)]
 
 
-main_code = extract_code(result)
-if not main_code:
-    raise ValueError("No python code block found")
-
-os.makedirs("workspace", exist_ok=True)
-path = os.path.join("workspace", "solution.py")
-with open(path, "w", encoding="utf-8") as f:
-    f.write(main_code[0])
-print(f"Saved code to {path}")
+def first_block(reply: str, lang: str) -> str:
+    """Return the first ```<lang> block, or raise if the model forgot it."""
+    blocks = extract_code(reply, lang)
+    if not blocks:
+        raise ValueError(f"No {lang} code block found in the reply")
+    return blocks[0]
 
 
 def failure_signature(output: str, timed_out: bool = False) -> str:
@@ -47,8 +38,15 @@ def failure_signature(output: str, timed_out: bool = False) -> str:
 
 def ruff_signature(output: str) -> str:
     """Stable label for ruff output: sorted rule codes, no line numbers."""
-    codes = re.findall(r":\d+:\d+: ([A-Z]+\d+)", output)
+    new_style = re.findall(r"^([A-Z]+\d+|invalid-syntax)\b", output, re.M)
+    old_style = re.findall(r":\d+:\d+: ([A-Z]+\d+)", output)
+    codes = new_style + old_style
     return ",".join(sorted(set(codes))) or "UNKNOWN"
+
+
+def build_builder_prompt(spec: str, tests: str) -> str:
+    """The builder sees the approved spec and tests."""
+    return f"## Spec\n{spec}\n\n## Tests\n{tests}\n"
 
 
 def build_fixer_prompt(spec: str, tests: str, code: str, failure_output: str) -> str:
@@ -60,23 +58,65 @@ def build_fixer_prompt(spec: str, tests: str, code: str, failure_output: str) ->
         f"## Failure output\n{failure_output}\n"
     )
 
-sigs = []
-for round_num in range(1, MAX_ROUNDS + 1) :
-    ruff_result = run_ruff("workspace")
 
-    if ruff_result["passed"] is False:
-        sig = ruff_signature(ruff_result["output"])
-    else:
-        pytest_result = run_pytest("workspace")
-        if pytest_result["passed"]:
-            print(f"Success code is generated and it took {round_num} of rounds")
-            break
+def call_role(role: str, user_text: str) -> str:
+    """Call the model for one role: its prompt file is the system prompt."""
+    with open(f"roles/{role}.md", "r", encoding="utf-8") as f:
+        system_prompt = f.read()
+    model = ChatGroq(model=MODELS[role], temperature=0)
+    response = model.invoke([("system", system_prompt), ("human", user_text)])
+    return response.content
+
+
+def write_workspace(name: str, text: str) -> str:
+    """Write one file into the workspace and return its path."""
+    os.makedirs(WORKSPACE, exist_ok=True)
+    path = os.path.join(WORKSPACE, name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+def run(request: str) -> bool:
+    """Plan, build, then check and fix for up to MAX_ROUNDS. True if the tests pass."""
+    plan = call_role("planner", request)
+    spec = first_block(plan, "markdown")
+    tests = first_block(plan, "python")
+    print("Planner done: spec and tests ready.")
+
+    code = first_block(call_role("builder", build_builder_prompt(spec, tests)), "python")
+
+    sigs = []
+    for round_num in range(1, MAX_ROUNDS + 1):
+        write_workspace("solution.py", code)
+        write_workspace("test_solution.py", tests)  # always the approved copy
+
+        ruff_result = run_ruff(WORKSPACE)
+        if ruff_result["passed"] is False:
+            failure_output = ruff_result["output"]
+            sig = ruff_signature(failure_output)
         else:
-            sig = failure_signature(pytest_result["output"], pytest_result["timed_out"])
+            pytest_result = run_pytest(WORKSPACE)
+            if pytest_result["passed"]:
+                print(f"Success: tests pass after {round_num} round(s).")
+                return True
+            failure_output = pytest_result["output"]
+            sig = failure_signature(failure_output, pytest_result["timed_out"])
 
-    sigs.append(sig)
-    if len(sigs) >= 3 and len(set(sigs[-3:])) == 1:
-        print(f"Stuck: same failure '{sig}' 3 times in a row. Stopping.")
-        break
-else:
+        print(f"Round {round_num} failed: {sig}")
+        sigs.append(sig)
+        if len(sigs) >= 3 and len(set(sigs[-3:])) == 1:
+            print(f"Stuck: same failure '{sig}' 3 times in a row. Stopping.")
+            return False
+        if round_num == MAX_ROUNDS:
+            break
+
+        fix_reply = call_role("fixer", build_fixer_prompt(spec, tests, code, failure_output))
+        code = first_block(fix_reply, "python")
+
     print(f"Out of rounds ({MAX_ROUNDS}). Last failure: {sigs[-1]}")
+    return False
+
+
+if __name__ == "__main__":
+    run(input("Enter your query : "))
