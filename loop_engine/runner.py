@@ -1,4 +1,5 @@
-import os
+"""Deterministic checks: ruff, then pytest, over a whole multi-file project."""
+
 import subprocess
 import sys
 
@@ -12,10 +13,12 @@ def _as_text(value) -> str:
     return value
 
 
-def run_pytest(workspace: str, timeout: int = 30):
+def run_pytest(workspace: str, python: str | None = None, timeout: int = 60):
+    """Run the project's tests with `python` (the project's own venv if it has one)."""
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", workspace, "-q"],
+            [python or sys.executable, "-m", "pytest", ".", "-q", "-p", "no:cacheprovider"],
+            cwd=workspace,
             capture_output=True,
             text=True,
             check=False,
@@ -35,10 +38,16 @@ def run_pytest(workspace: str, timeout: int = 30):
         }
 
 
-def run_ruff(workspace: str, timeout: int = 10):
+def run_ruff(workspace: str, timeout: int = 20):
+    """Static checks (syntax errors and pyflakes rules) over every .py file in the project."""
     try:
         ruff = subprocess.run(
-            [sys.executable, "-m", "ruff", "check", os.path.join(workspace, "solution.py"), "--no-respect-gitignore", "--select", "E9,F"],
+            [
+                sys.executable, "-m", "ruff", "check", ".",
+                "--no-respect-gitignore", "--select", "E9,F",
+                "--exclude", ".venv,.loop,.git,__pycache__",
+            ],
+            cwd=workspace,
             capture_output=True,
             text=True,
             check=False,

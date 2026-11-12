@@ -10,6 +10,9 @@ from collections.abc import Callable, Iterator
 from loop_engine.control import ControlChannel
 from loop_engine.events import Event
 
+SKIP = object()  # the user typed /skip while a question was open
+STOP = object()  # the user typed /stop while a question was open
+
 
 class Steerable:
     def __init__(
@@ -66,3 +69,19 @@ class Steerable:
         if not self.ask_approval():
             return "yes"
         return (yield from self._await_approval(what))
+
+    def _ask(self, question: str) -> Iterator[Event]:
+        """Ask the user a question and wait. Returns their text, SKIP or STOP."""
+        yield Event(kind="intake_question", text=question)
+        while True:
+            msg = self.channel.receive()
+            if msg is None:
+                time.sleep(0.05)
+                continue
+            kind, payload = msg
+            if kind == "answer":
+                return payload or ""
+            if kind == "skip":
+                return SKIP
+            if kind == "stop":
+                return STOP

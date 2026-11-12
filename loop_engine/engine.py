@@ -1,12 +1,15 @@
-"""The real engine: plan, build, then check and fix. v1's loop, but it emits events.
+"""The real engine: intake, spec, split, parallel build, check and fix. It emits events.
 
 It never prints. At safe points between steps it reads the control channel
-(pause, stop, steer, approvals), so the CLI can steer a live run.
+(pause, stop, steer, answers, approvals), so the CLI can steer a live run.
 """
 
+import json
 import os
 import re
+import traceback
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -14,11 +17,23 @@ from langchain_groq import ChatGroq
 
 from loop_engine.config import MODELS
 from loop_engine.control import ControlChannel
+from loop_engine.env import ensure_env
 from loop_engine.events import Event
+from loop_engine.intake import format_brief, parse_questions
+from loop_engine.pipeline import (
+    MAX_PARALLEL,
+    affected_tasks,
+    build_graph,
+    collect_files,
+    files_from_reply,
+    parse_file_blocks,
+    parse_split,
+)
+from loop_engine.project import resolve_location, slugify
 from loop_engine.runner import run_pytest, run_ruff
-from loop_engine.steering import Steerable
+from loop_engine.steering import SKIP, STOP, Steerable
 from loop_engine.vcs import (
-    WORKSPACE,
+    add_remote,
     best_round,
     changed_summary,
     commit_round,
@@ -33,21 +48,17 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 load_dotenv()
 
 MAX_ROUNDS = 7
-LOG_PATH = os.path.join(WORKSPACE, "log.md")
+STUCK_RETRY_ROUNDS = 3  # extra rounds granted each time the user says "retry"
+MAX_STUCK_PROMPTS = 3  # then the run stops for good
 
 
-# ---- pure helpers (unchanged from v1) --------------------------------------
-
-
-def extract_code(result: str, lang: str = "python") -> list[str]:
-    """Return the contents of every ```<lang> block in the reply."""
-    pattern = rf"```{re.escape(lang)}[ \t]*\n(.*?)```"
-    return [block.strip() for block in re.findall(pattern, result, re.DOTALL)]
+# ---- pure helpers -----------------------------------------------------------
 
 
 def first_block(reply: str, lang: str) -> str:
     """Return the first ```<lang> block, or raise if the model forgot it."""
-    blocks = extract_code(reply, lang)
+    pattern = rf"```{re.escape(lang)}[ \t]*\n(.*?)```"
+    blocks = [b.strip() for b in re.findall(pattern, reply, re.DOTALL)]
     if not blocks:
         raise ValueError(f"No {lang} code block found in the reply")
     return blocks[0]
@@ -80,18 +91,36 @@ def count_passed(output: str) -> int:
     return int(counts[0]) if counts else 0
 
 
-def build_builder_prompt(spec: str, tests: str) -> str:
-    """The builder sees the approved spec and tests."""
-    return f"## Spec\n{spec}\n\n## Tests\n{tests}\n"
+def format_files(files: dict[str, str]) -> str:
+    """Files as prompt text: a heading and a fenced block per file."""
+    fence = "`" * 3
+    return "\n".join(f"### {path}\n{fence}\n{text.rstrip()}\n{fence}\n" for path, text in files.items())
 
 
-def build_fixer_prompt(spec: str, tests: str, code: str, failure_output: str) -> str:
-    """One prompt for the fixer: what it should do, what exists, and what went wrong."""
+def build_task_prompt(task: dict, context: dict[str, str], tests_text: str) -> str:
+    """What one builder sees: its task, its dependencies' files and the tests. Not the whole spec."""
+    parts = [
+        f"## Task: {task['title']}",
+        f"Files to write: {', '.join(task['files'])}",
+        f"\n### Brief\n{task['brief']}",
+    ]
+    if context:
+        parts.append(f"\n## Files from the tasks you depend on\n{format_files(context)}")
+    parts.append(f"\n## Tests\n{tests_text}")
+    return "\n".join(parts) + "\n"
+
+
+def build_fixer_prompt(
+    spec: str, tests_text: str, task: dict, current: dict[str, str], failure_output: str
+) -> str:
+    """What one fixer sees: the spec, the tests, its task and files, and the real failure."""
     return (
         f"## Spec\n{spec}\n\n"
-        f"## Tests\n{tests}\n\n"
-        f"## Current solution.py\n{code}\n\n"
-        f"## Failure output\n{failure_output}\n"
+        f"## Tests\n{tests_text}\n"
+        f"## Task: {task['title']}\nFiles you own: {', '.join(task['files'])}\n\n"
+        f"### Brief\n{task['brief']}\n\n"
+        f"## Current files\n{format_files(current)}\n"
+        f"## Failure output\n{failure_output[:4000]}\n"
     )
 
 
@@ -103,23 +132,31 @@ def call_role(role: str, user_text: str) -> str:
     return response.content
 
 
-def write_workspace(name: str, text: str) -> str:
-    """Write one file into the workspace and return its path."""
-    os.makedirs(WORKSPACE, exist_ok=True)
-    path = os.path.join(WORKSPACE, name)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+def write_files(workspace: str, files: dict[str, str]) -> None:
+    """Write project files, creating folders as needed."""
+    for path, text in files.items():
+        full = os.path.join(workspace, path)
+        os.makedirs(os.path.dirname(full) or workspace, exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(text)
+
+
+def loop_dir(workspace: str) -> str:
+    """The folder for the engine's own records: log, spec, run info, saved errors."""
+    path = os.path.join(workspace, ".loop")
+    os.makedirs(path, exist_ok=True)
     return path
 
 
-def reset_log(request: str) -> None:
+def reset_log(workspace: str, request: str) -> None:
     """Start a fresh log.md for this run."""
-    os.makedirs(WORKSPACE, exist_ok=True)
-    with open(LOG_PATH, "w", encoding="utf-8") as f:
-        f.write(f"# Run log\n\nRequest: {request}\n")
+    with open(os.path.join(loop_dir(workspace), "log.md"), "w", encoding="utf-8") as f:
+        f.write(f"# Run log\n\n{request}\n")
 
 
-def log_round(round_num: int, commit_id: str, passed: bool, score: int, sig: str, output: str) -> None:
+def log_round(
+    workspace: str, round_num: int, commit_id: str, passed: bool, score: int, sig: str, output: str
+) -> None:
     """Append what happened this round: result, what changed since last round, the failure."""
     fence = "`" * 3
     status = "PASS" if passed else "FAIL"
@@ -130,12 +167,12 @@ def log_round(round_num: int, commit_id: str, passed: bool, score: int, sig: str
         f"- failure: {'none' if passed else sig}",
         "- changed this round:",
         fence,
-        changed_summary(),
+        changed_summary(workspace),
         fence,
     ]
     if not passed:
         lines += ["- output (first 1500 chars):", fence, output.strip()[:1500], fence]
-    with open(LOG_PATH, "a", encoding="utf-8") as f:
+    with open(os.path.join(loop_dir(workspace), "log.md"), "a", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
 
@@ -143,8 +180,8 @@ def _stopped() -> Event:
     return Event(kind="loop_done", text="stopped")
 
 
-def _declined() -> Event:
-    return Event(kind="loop_done", text="stopped: approval declined")
+def _denied(answer: str) -> Event:
+    return _stopped() if answer == "stop" else Event(kind="loop_done", text="stopped: approval declined")
 
 
 # ---- the engine -------------------------------------------------------------
@@ -157,14 +194,25 @@ class Engine(Steerable):
         ask_approval: Callable[[], bool] = lambda: False,
         model: Callable[[str, str], str] = call_role,
         check_ruff: Callable[[str], dict] = run_ruff,
-        check_pytest: Callable[[str], dict] = run_pytest,
+        check_pytest: Callable[[str, str | None], dict] = run_pytest,
+        prepare_env: Callable[[str], str] = ensure_env,
         max_rounds: int = MAX_ROUNDS,
+        workspace: str | None = None,
+        base_dir: str | None = None,
+        intake: bool = False,
+        ask_when_stuck: bool = False,
     ) -> None:
         super().__init__(channel, ask_approval)
         self.model = model
         self.check_ruff = check_ruff
         self.check_pytest = check_pytest
+        self.prepare_env = prepare_env
         self.max_rounds = max_rounds
+        self.workspace = workspace  # None: decided during intake or from the request
+        self.base_dir = base_dir
+        self.intake = intake
+        self.ask_when_stuck = ask_when_stuck
+        self.python: str | None = None
 
     def _call(self, role: str, text: str) -> str:
         """Call the model. All steering so far goes into the prompt, in order."""
@@ -174,48 +222,221 @@ class Engine(Steerable):
         return self.model(role, text)
 
     def run(self, request: str) -> Iterator[Event]:
-        """Plan, build, then check and fix for up to max_rounds."""
+        """Intake, plan, split, build, then check and fix. A crash leaves .loop/error.txt."""
+        try:
+            yield from self._run(request)
+        except Exception:
+            self._save_error()
+            raise
+
+    def _save_error(self) -> None:
+        if self.workspace and os.path.isdir(self.workspace):
+            with open(os.path.join(loop_dir(self.workspace), "error.txt"), "w", encoding="utf-8") as f:
+                f.write(traceback.format_exc())
+
+    # -- intake --
+
+    def _intake(self, request: str, ask_location: bool) -> Iterator[Event]:
+        """Ask clarifying questions. Returns (brief, location_text), or None if the run ended."""
+        yield Event(kind="phase_started", text="intake: a few questions first (/skip to start right away)")
+        answers: list[tuple[str, str]] = []
+        skipped = False
+        for question in parse_questions(self.model("intake", request)):
+            answer = yield from self._ask(question)
+            if answer is STOP:
+                yield _stopped()
+                return None
+            if answer is SKIP:
+                skipped = True
+                break
+            answers.append((question, answer))
+        location = ""
+        if ask_location and not skipped:
+            answer = yield from self._ask(
+                "Where should the project be created? A local path or a GitHub URL (Enter: a new folder here)"
+            )
+            if answer is STOP:
+                yield _stopped()
+                return None
+            if answer is SKIP:
+                skipped = True
+            else:
+                location = answer
+        brief = format_brief(request, answers)
+        if not skipped:
+            yield Event(kind="brief_ready", text=brief)
+            answer = yield from self._ask("Start building with this brief? (y/n)")
+            if answer is STOP:
+                yield _stopped()
+                return None
+            if answer is not SKIP and answer.strip().lower() in ("n", "no"):
+                yield Event(kind="loop_done", text="stopped: brief rejected, start again with a new prompt")
+                return None
+        return brief, location
+
+    # -- sub-agents --
+
+    def _run_builder(self, task: dict, context: dict[str, str], tests_text: str) -> dict[str, str]:
+        only_file = task["files"][0] if len(task["files"]) == 1 else None
+        return files_from_reply(self._call("builder", build_task_prompt(task, context, tests_text)), only_file)
+
+    def _fix_tasks(
+        self,
+        affected: list[dict],
+        files: dict[str, str],
+        spec: str,
+        tests_text: str,
+        failure_output: str,
+        protected: set[str],
+    ) -> Iterator[Event]:
+        """Fix the affected tasks in parallel. Returns {path: new text}."""
+        for task in affected:
+            yield Event(kind="agent_started", text=f"fixing {task['title']}")
+
+        def work(task: dict) -> dict[str, str]:
+            current = {p: files[p] for p in task["files"] if p in files}
+            prompt = build_fixer_prompt(spec, tests_text, task, current, failure_output)
+            only_file = task["files"][0] if len(task["files"]) == 1 else None
+            return files_from_reply(self._call("fixer", prompt), only_file)
+
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(affected))) as pool:
+            results = list(pool.map(work, affected))
+        updates: dict[str, str] = {}
+        for task, new in zip(affected, results, strict=True):
+            for path, text in new.items():
+                if path in protected:
+                    yield Event(kind="conflict", text=f"fixer for {task['id']} tried to change protected {path}; ignored")
+                else:
+                    updates[path] = text
+            yield Event(kind="agent_done", text=f"fixed {task['title']}: {', '.join(sorted(new))}")
+        return updates
+
+    # -- the run --
+
+    def _run(self, request: str) -> Iterator[Event]:
         if (yield from self._checkpoint()):
             yield _stopped()
             return
+
+        # 1. intake and where the project goes
+        brief = request
+        location_text = ""
+        if self.intake:
+            result = yield from self._intake(request, ask_location=self.workspace is None)
+            if result is None:
+                return
+            brief, location_text = result
+        remote = None
+        if self.workspace is None:
+            try:
+                location = resolve_location(location_text, self.base_dir or os.getcwd(), slugify(request))
+            except ValueError as exc:
+                yield Event(kind="error", text=str(exc))
+                yield Event(kind="loop_done", text="failed: bad project location")
+                return
+            self.workspace, remote = location.path, location.remote
+        ws = self.workspace
+        init_repo(ws)
+        if remote:
+            add_remote(ws, remote)
+        loop_dir(ws)
+        yield Event(kind="repo_ready", text=ws)
+        if remote:
+            yield Event(kind="remote_set", text=remote)
+        reset_log(ws, brief)
+
+        # 2. spec and tests
         yield Event(kind="phase_started", text="planning: writing the spec and tests")
-        plan = self._call("planner", request)
+        plan = self._call("planner", brief)
         spec = first_block(plan, "markdown")
-        tests = first_block(plan, "python")
-        yield Event(kind="spec_written", text="spec and tests ready")
+        planner_files = parse_file_blocks(plan)
+        if not planner_files:  # a plain ```python block is the v1-style single test file
+            planner_files = {"test_solution.py": first_block(plan, "python") + "\n"}
+        protected = set(planner_files)  # the tests and requirements.txt are the approved contract
+        has_requirements = "requirements.txt" in planner_files
+        tests_text = format_files({p: t for p, t in planner_files.items() if p != "requirements.txt"})
+        with open(os.path.join(loop_dir(ws), "spec.md"), "w", encoding="utf-8") as f:
+            f.write(spec + "\n")
+        yield Event(kind="spec_written", text="spec and tests ready (.loop/spec.md)")
 
+        # 3. split into tasks
         if (yield from self._checkpoint()):
             yield _stopped()
             return
-        yield Event(kind="phase_started", text="building")
-        code = first_block(self._call("builder", build_builder_prompt(spec, tests)), "python")
+        yield Event(kind="phase_started", text="splitting the spec into tasks")
+        tasks, run_info = parse_split(self._call("splitter", f"## Spec\n{spec}\n\n## Tests\n{tests_text}"))
+        if run_info:
+            with open(os.path.join(loop_dir(ws), "run.json"), "w", encoding="utf-8") as f:
+                json.dump(run_info, f, indent=2)
+        yield Event(kind="tasks_created", text=f"{len(tasks)} task(s): " + ", ".join(t["title"] for t in tasks))
 
-        init_repo()
-        reset_log(request)
+        # 4. parallel sub-agents, then collect their files
+        yield Event(kind="phase_started", text="building")
+        graph = build_graph(lambda task, context: self._run_builder(task, context, tests_text))
+        outputs: dict[str, dict[str, str]] = {}
+        stream = graph.stream(
+            {"tasks": tasks, "outputs": {}},
+            config={"max_concurrency": MAX_PARALLEL},
+            stream_mode=["custom", "values"],
+        )
+        try:
+            for mode, chunk in stream:
+                if mode == "custom":
+                    yield Event(**chunk)
+                else:
+                    outputs = chunk["outputs"]
+                if (yield from self._checkpoint()):
+                    yield _stopped()
+                    return
+        finally:
+            stream.close()
+        files, conflicts = collect_files(tasks, outputs, protected)
+        for conflict in conflicts:
+            yield Event(kind="conflict", text=conflict)
+        yield Event(kind="files_collected", text=f"{len(files)} file(s) from {len(tasks)} task(s)")
+
+        # 5. check and fix
         sigs: list[str] = []
         last_commit = ""
         outcome = "failed"
-        for round_num in range(1, self.max_rounds + 1):
+        round_num = 0
+        limit = self.max_rounds
+        stuck_prompts = 0
+        while round_num < limit:
+            round_num += 1
             if (yield from self._checkpoint()):
                 yield _stopped()
                 return
             yield Event(kind="phase_started", text=f"round {round_num}: write and check")
 
-            answer = yield from self._gate("file_written: solution.py, test_solution.py")
+            answer = yield from self._gate(f"file_written: {len(files) + len(protected)} file(s)")
             if answer != "yes":
-                yield _stopped() if answer == "stop" else _declined()
+                yield _denied(answer)
                 return
-            write_workspace("solution.py", code)
-            write_workspace("test_solution.py", tests)  # always the approved copy
-            yield Event(kind="file_written", text="solution.py")
-            yield Event(kind="file_written", text="test_solution.py")
+            write_files(ws, planner_files)  # always the approved copy
+            write_files(ws, files)
+            for path in [*planner_files, *files]:
+                yield Event(kind="file_written", text=path)
+
+            if has_requirements and self.python is None:
+                answer = yield from self._gate("command_run: install requirements.txt")
+                if answer != "yes":
+                    yield _denied(answer)
+                    return
+                yield Event(kind="command_run", text="install requirements.txt (uv)")
+                try:
+                    self.python = self.prepare_env(ws)
+                except RuntimeError as exc:
+                    yield Event(kind="error", text=str(exc))
+                    yield Event(kind="loop_done", text="failed: could not install requirements")
+                    return
 
             answer = yield from self._gate("command_run: ruff check")
             if answer != "yes":
-                yield _stopped() if answer == "stop" else _declined()
+                yield _denied(answer)
                 return
             yield Event(kind="command_run", text="ruff check")
-            ruff_result = self.check_ruff(WORKSPACE)
+            ruff_result = self.check_ruff(ws)
             if ruff_result.get("passed") is False:
                 passed, score = False, 0
                 failure_output = ruff_result["output"]
@@ -224,44 +445,62 @@ class Engine(Steerable):
             else:
                 answer = yield from self._gate("command_run: pytest")
                 if answer != "yes":
-                    yield _stopped() if answer == "stop" else _declined()
+                    yield _denied(answer)
                     return
                 yield Event(kind="command_run", text="pytest")
-                pytest_result = self.check_pytest(WORKSPACE)
+                pytest_result = self.check_pytest(ws, self.python)
                 passed = pytest_result["passed"]
                 failure_output = pytest_result["output"]
                 score = count_passed(failure_output)
                 sig = "PASS" if passed else failure_signature(failure_output, pytest_result["timed_out"])
-                result_text = f"PASS: {score} passed" if passed else f"FAIL (pytest): {sig}"
-                yield Event(kind="test_result", text=result_text)
+                yield Event(kind="test_result", text=f"PASS: {score} passed" if passed else f"FAIL (pytest): {sig}")
 
-            last_commit = commit_round(round_num, score, sig)
-            log_round(round_num, last_commit, passed, score, sig, failure_output)
+            last_commit = commit_round(round_num, score, sig, workspace=ws)
+            log_round(ws, round_num, last_commit, passed, score, sig, failure_output)
 
             if passed:
                 yield Event(kind="loop_done", text=f"success: tests pass after {round_num} round(s)")
                 return
 
             sigs.append(sig)
-            if len(sigs) >= 3 and len(set(sigs[-3:])) == 1:
-                outcome = f"failed: stuck, same failure '{sig}' 3 times in a row"
-                break
-            if round_num == self.max_rounds:
-                outcome = f"failed: out of rounds ({self.max_rounds}), last failure {sigs[-1]}"
-                break
+            stuck = len(sigs) >= 3 and len(set(sigs[-3:])) == 1
+            if stuck or round_num == limit:
+                reason = (
+                    f"stuck: same failure '{sig}' 3 times in a row"
+                    if stuck
+                    else f"out of rounds ({limit}), last failure {sig}"
+                )
+                if self.ask_when_stuck and stuck_prompts < MAX_STUCK_PROMPTS:
+                    stuck_prompts += 1
+                    yield Event(kind="stuck", text=reason)
+                    answer = yield from self._ask("Type 'retry', give guidance for the fixer, or 'stop'")
+                    if answer is STOP or answer is SKIP or answer.strip().lower() in ("", "stop"):
+                        outcome = f"failed: {reason}"
+                        break
+                    if answer.strip().lower() != "retry":
+                        self.steer_notes.append(answer.strip())
+                    limit += STUCK_RETRY_ROUNDS
+                    sigs.clear()
+                else:
+                    outcome = f"failed: {reason}"
+                    break
 
             if (yield from self._checkpoint()):
                 yield _stopped()
                 return
-            yield Event(kind="phase_started", text=f"round {round_num} failed ({sig}): fixing")
-            fix_reply = self._call("fixer", build_fixer_prompt(spec, tests, code, failure_output))
-            code = first_block(fix_reply, "python")
+            affected = affected_tasks(tasks, failure_output)
+            yield Event(
+                kind="phase_started",
+                text=f"round {round_num} failed ({sig}): fixing {len(affected)} task(s)",
+            )
+            updates = yield from self._fix_tasks(affected, files, spec, tests_text, failure_output, protected)
+            files.update(updates)
 
-        best = best_round()
+        best = best_round(ws)
         if best and best["id"] != last_commit:
-            rewind_to(best["id"])
+            rewind_to(best["id"], ws)
             yield Event(
                 kind="rewound",
-                text=f"workspace restored to round {best['round']} ({best['id']}), score {best['score']}",
+                text=f"project restored to round {best['round']} ({best['id']}), score {best['score']}",
             )
         yield Event(kind="loop_done", text=outcome)

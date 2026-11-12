@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 from loop_engine.control import ControlChannel
@@ -39,7 +41,8 @@ def make_engine(pytest_results, model=None, channel=None, **kw):
         channel or ControlChannel(),
         model=model or FakeModel(),
         check_ruff=lambda ws: RUFF_OK,
-        check_pytest=lambda ws: next(results),
+        check_pytest=lambda ws, py=None: next(results),
+        prepare_env=lambda ws: sys.executable,
         **kw,
     )
 
@@ -50,7 +53,11 @@ def kinds(events):
 
 def test_success_on_first_round():
     events = list(make_engine([PASS]).run("a tiny project"))
-    assert kinds(events)[0] == "phase_started"
+    assert kinds(events)[0] == "repo_ready"
+    assert "phase_started" in kinds(events)
+    assert "tasks_created" in kinds(events)
+    assert "agent_done" in kinds(events)
+    assert "files_collected" in kinds(events)
     assert "spec_written" in kinds(events)
     assert "file_written" in kinds(events)
     assert events[-1].kind == "loop_done"
@@ -60,7 +67,7 @@ def test_success_on_first_round():
 def test_failure_is_routed_to_the_fixer_then_passes():
     model = FakeModel()
     events = list(make_engine([FAIL, PASS], model=model).run("a tiny project"))
-    assert model.roles() == ["planner", "builder", "fixer"]
+    assert model.roles() == ["planner", "splitter", "builder", "fixer"]
     assert events[-1].text == "success: tests pass after 2 round(s)"
 
 
@@ -77,7 +84,7 @@ def test_ruff_failure_skips_pytest():
         ControlChannel(),
         model=FakeModel(),
         check_ruff=lambda ws: ruff_bad,
-        check_pytest=lambda ws: calls.append(1) or PASS,
+        check_pytest=lambda ws, py=None: calls.append(1) or PASS,
         max_rounds=1,
     )
     events = list(engine.run("a tiny project"))

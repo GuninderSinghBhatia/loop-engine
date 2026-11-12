@@ -5,7 +5,8 @@ Signals: pause, resume, stop, steer(text), approval(yes|no).
 
 from queue import Empty, Queue
 
-URGENT_KINDS = {"pause", "resume", "stop", "approval"}
+# The engine is blocked waiting for "approval", "answer" and "skip": they must not queue.
+URGENT_KINDS = {"pause", "resume", "stop", "approval", "answer", "skip"}
 
 
 class ControlChannel:
