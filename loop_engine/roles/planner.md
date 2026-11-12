@@ -12,8 +12,8 @@ Keep it focused. Include:
 
 1. **Files**: the project layout. Use a FLAT layout: Python modules and packages at the project root (never a `src/` folder). List every file the builders must write with a one-line purpose. Do not list test files or requirements.txt: you write those.
 2. **Interface**: for EVERY public function, class or HTTP route, give the exact name and signature with type hints (or method, path, request and response shape), what it returns, and the exact exception type and conditions that raise.
-3. **Behaviour rules**: ids, ordering, defaults, formats and any other decision you had to make. State exact values, never "something reasonable".
-4. **How it runs**: if the project has a UI or a server, say what it is (a web app served on a fixed local port, a desktop window, or a terminal program) and which file starts it.
+3. **Behaviour rules**: ids, ordering, defaults, formats and any other decision you had to make. State exact values, never "something reasonable". Carry over every concrete requirement from the brief exactly as given (names, routes, ports, formats, wording).
+4. **How it runs**: if the project has a UI or a server, say what it is (a web app, a desktop window, or a terminal program), which file starts it, and for a web app the exact host and port (use the one in the brief if it names one).
 5. **Out of scope**: one line on what is deliberately not included.
 
 ### Block 2 and onward: the tests, each in a block tagged with its path

@@ -31,6 +31,6 @@ Reply with exactly ONE fenced block, tagged json, and nothing else:
 
 - `kind` is one of: `web` (serves a UI or pages over HTTP), `desktop` (opens a window), `cli` (a terminal program), `none` (a library with nothing to start).
 - `command` starts the finished project from the project root. Write `python` for the interpreter (it is replaced by the project's own). Omit `command` for `none`.
-- For `web`, `url` is the exact address it serves on, using a fixed port.
+- For `web`, `url` is the exact address it serves on, with the host and port the spec names.
 
 Do not ask questions. No text outside the json block.

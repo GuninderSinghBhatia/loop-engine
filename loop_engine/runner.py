@@ -44,8 +44,10 @@ def run_ruff(workspace: str, timeout: int = 20):
         ruff = subprocess.run(
             [
                 sys.executable, "-m", "ruff", "check", ".",
-                "--no-respect-gitignore", "--select", "E9,F",
-                "--exclude", ".venv,.loop,.git,__pycache__",
+                # --isolated: ignore any ruff.toml / pyproject.toml the project contains, so a
+                # fixer cannot silence the check. Tests are the planner's, not ours to lint.
+                "--isolated", "--no-respect-gitignore", "--select", "E9,F",
+                "--exclude", ".venv,.loop,.git,__pycache__,test_*.py,*_test.py,conftest.py",
             ],
             cwd=workspace,
             capture_output=True,

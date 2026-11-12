@@ -16,7 +16,12 @@ from langgraph.types import Send
 
 MAX_PARALLEL = 4  # most sub-agents running at once
 
-_PATH_BLOCK = re.compile(r"```[\w+.-]*[ \t]+path=(\S+)[ \t]*\n(.*?)```", re.DOTALL)
+# A file block's header names the file. Models vary: "python path=app.py", "python app.py",
+# 'python filename="app.py"'. All of them are accepted.
+_PATH_BLOCK = re.compile(
+    r"```[\w+.-]*[ \t]+(?:(?:path|file|filename)[=:][ \t]*)?[\"']?([\w./\\-]+\.\w+)[\"']?[ \t]*\n(.*?)```",
+    re.DOTALL,
+)
 _PLAIN_BLOCK = re.compile(r"```python[ \t]*\n(.*?)```", re.DOTALL)
 _RESERVED = (".git", ".loop", ".venv")
 
@@ -45,6 +50,28 @@ def parse_file_blocks(reply: str) -> dict[str, str]:
         if safe:
             files[safe] = body.strip("\n") + "\n"
     return files
+
+
+def extract_spec(reply: str) -> str:
+    """The planner's ```markdown spec.
+
+    The spec may contain code fences of its own, so it is cut at the start of the first
+    file block (or the last plain python block), not at the first inner fence.
+    """
+    start = re.search(r"```markdown[ \t]*\n", reply)
+    if not start:
+        raise ValueError("No markdown code block found in the reply")
+    rest = reply[start.end():]
+    cut = _PATH_BLOCK.search(rest)
+    if cut:
+        end = cut.start()
+    else:
+        plain = list(re.finditer(r"```python[ \t]*\n", rest))
+        end = plain[-1].start() if plain else len(rest)
+    body = rest[:end].rstrip()
+    if body.endswith("```"):
+        body = body[:-3].rstrip()
+    return body
 
 
 def files_from_reply(reply: str, fallback_path: str | None) -> dict[str, str]:
@@ -77,6 +104,22 @@ def default_split(note: str = "") -> tuple[list[dict], dict | None]:
     return [task], None
 
 
+def is_default_split(tasks: list[dict]) -> bool:
+    return len(tasks) == 1 and tasks[0]["id"] == "main" and tasks[0]["files"] == ["solution.py"]
+
+
+def guess_files(spec: str) -> list[str]:
+    """Source files named in the spec (not tests), for when the split could not be read."""
+    names = re.findall(r"[\w./-]+\.(?:py|html|css|js)\b", spec)
+    seen: list[str] = []
+    for name in names:
+        safe = safe_relpath(name)
+        base = (safe or "").rsplit("/", 1)[-1]
+        if safe and not base.startswith("test_") and not base.endswith("_test.py") and safe not in seen:
+            seen.append(safe)
+    return seen
+
+
 def _has_cycle(tasks: list[dict]) -> bool:
     done: set[str] = set()
     remaining = list(tasks)
@@ -95,11 +138,14 @@ def parse_split(reply: str) -> tuple[list[dict], dict | None]:
     Anything malformed falls back to a single task, so a bad split never stops a build.
     run_info is {"kind": "web|desktop|cli|none", "command": ..., "url": ...} or None.
     """
-    match = re.search(r"```json[ \t]*\n(.*?)```", reply, re.DOTALL)
-    if not match:
+    # A brief may contain code fences of its own, so parse one JSON object instead of
+    # cutting the reply at the first closing fence.
+    fence = re.search(r"```json[ \t]*\n", reply)
+    start = reply.find("{", fence.end() if fence else 0)
+    if start < 0:
         return default_split()
     try:
-        data = json.loads(match.group(1))
+        data, _ = json.JSONDecoder().raw_decode(reply[start:])
         raw_tasks = data["tasks"]
         tasks = []
         for raw in raw_tasks:

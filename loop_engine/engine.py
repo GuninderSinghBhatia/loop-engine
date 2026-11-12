@@ -25,7 +25,10 @@ from loop_engine.pipeline import (
     affected_tasks,
     build_graph,
     collect_files,
+    extract_spec,
     files_from_reply,
+    guess_files,
+    is_default_split,
     parse_file_blocks,
     parse_split,
 )
@@ -276,9 +279,31 @@ class Engine(Steerable):
 
     # -- sub-agents --
 
+    def _files_from_model(self, role: str, prompt: str, only_file: str | None) -> dict[str, str]:
+        """Ask a builder or fixer for files. One malformed reply gets one corrective retry."""
+        reply = self._call(role, prompt)
+        try:
+            return files_from_reply(reply, only_file)
+        except ValueError:
+            self._save_bad_reply(role, reply)
+        retry = (
+            prompt
+            + "\n\n## Format error\nYour previous reply had no files in the required format. "
+            "Reply again with ONLY fenced blocks, each tagged with the language and the file "
+            "path, for example: ```python path=app.py"
+        )
+        return files_from_reply(self._call(role, retry), only_file)
+
+    def _save_bad_reply(self, role: str, reply: str) -> None:
+        """Keep the raw reply in .loop/ so a format problem can be diagnosed afterwards."""
+        if self.workspace:
+            name = f"bad_reply_{role}_{abs(hash(reply)) % 10000}.txt"
+            with open(os.path.join(loop_dir(self.workspace), name), "w", encoding="utf-8") as f:
+                f.write(reply)
+
     def _run_builder(self, task: dict, context: dict[str, str], tests_text: str) -> dict[str, str]:
         only_file = task["files"][0] if len(task["files"]) == 1 else None
-        return files_from_reply(self._call("builder", build_task_prompt(task, context, tests_text)), only_file)
+        return self._files_from_model("builder", build_task_prompt(task, context, tests_text), only_file)
 
     def _fix_tasks(
         self,
@@ -297,15 +322,18 @@ class Engine(Steerable):
             current = {p: files[p] for p in task["files"] if p in files}
             prompt = build_fixer_prompt(spec, tests_text, task, current, failure_output)
             only_file = task["files"][0] if len(task["files"]) == 1 else None
-            return files_from_reply(self._call("fixer", prompt), only_file)
+            return self._files_from_model("fixer", prompt, only_file)
 
         with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(affected))) as pool:
             results = list(pool.map(work, affected))
         updates: dict[str, str] = {}
         for task, new in zip(affected, results, strict=True):
             for path, text in new.items():
-                if path in protected:
-                    yield Event(kind="conflict", text=f"fixer for {task['id']} tried to change protected {path}; ignored")
+                if path not in task["files"]:
+                    # Protected tests, and also config files such as ruff.toml that would
+                    # silence a check instead of fixing the code.
+                    reason = "protected" if path in protected else "outside its task"
+                    yield Event(kind="conflict", text=f"fixer for {task['id']} wrote {path} ({reason}); ignored")
                 else:
                     updates[path] = text
             yield Event(kind="agent_done", text=f"fixed {task['title']}: {', '.join(sorted(new))}")
@@ -348,7 +376,7 @@ class Engine(Steerable):
         # 2. spec and tests
         yield Event(kind="phase_started", text="planning: writing the spec and tests")
         plan = self._call("planner", brief)
-        spec = first_block(plan, "markdown")
+        spec = extract_spec(plan)
         planner_files = parse_file_blocks(plan)
         if not planner_files:  # a plain ```python block is the v1-style single test file
             planner_files = {"test_solution.py": first_block(plan, "python") + "\n"}
@@ -365,6 +393,8 @@ class Engine(Steerable):
             return
         yield Event(kind="phase_started", text="splitting the spec into tasks")
         tasks, run_info = parse_split(self._call("splitter", f"## Spec\n{spec}\n\n## Tests\n{tests_text}"))
+        if is_default_split(tasks):  # the split was unreadable: take the files from the spec instead
+            tasks[0]["files"] = guess_files(spec) or tasks[0]["files"]
         if run_info:
             with open(os.path.join(loop_dir(ws), "run.json"), "w", encoding="utf-8") as f:
                 json.dump(run_info, f, indent=2)
