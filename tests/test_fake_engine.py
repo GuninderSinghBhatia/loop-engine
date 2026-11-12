@@ -27,3 +27,40 @@ def test_steer_is_acknowledged():
     events = list(FakeEngine(ch).run("build a todo app"))
     steer = [e for e in events if e.kind == "steer_received"]
     assert steer and steer[0].text == "make it red"
+
+
+def run_with_answers(answer):
+    """Run with approval on, answering every approval request with `answer`."""
+    ch = ControlChannel()
+    events = []
+    for e in FakeEngine(ch, ask_approval=lambda: True).run("build a todo app"):
+        events.append(e)
+        if e.kind == "approval_needed":
+            ch.send("approval", answer)
+    return events
+
+
+def test_approval_no_skips_the_step():
+    events = run_with_answers("no")
+    ks = [e.kind for e in events]
+    assert "approval_needed" in ks
+    assert "step_skipped" in ks
+    assert "file_written" not in ks
+    assert ks[-1] == "loop_done"
+
+
+def test_approval_yes_runs_the_step():
+    ks = [e.kind for e in run_with_answers("yes")]
+    assert "file_written" in ks
+    assert "step_skipped" not in ks
+
+
+def test_stop_while_waiting_for_approval():
+    ch = ControlChannel()
+    events = []
+    for e in FakeEngine(ch, ask_approval=lambda: True).run("x"):
+        events.append(e)
+        if e.kind == "approval_needed":
+            ch.send("stop")
+    assert events[-1].kind == "loop_done"
+    assert events[-1].text == "stopped"
