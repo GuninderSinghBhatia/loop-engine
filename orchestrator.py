@@ -6,10 +6,11 @@ from langchain_groq import ChatGroq
 
 from config import MODELS
 from runner import run_pytest, run_ruff
+from vcs import best_round, changed_summary, commit_round, init_repo, rewind_to
 
 load_dotenv()
 
-MAX_ROUNDS = 3
+MAX_ROUNDS = 7
 WORKSPACE = "workspace"
 
 
@@ -42,6 +43,16 @@ def ruff_signature(output: str) -> str:
     old_style = re.findall(r":\d+:\d+: ([A-Z]+\d+)", output)
     codes = new_style + old_style
     return ",".join(sorted(set(codes))) or "UNKNOWN"
+
+
+def count_passed(output: str) -> int:
+    """Number of passed tests from pytest's summary line, or 0 if there isn't one."""
+    # The summary is the last line ending in "in <seconds>s"; only look for "passed" there.
+    summaries = re.findall(r"^.*\bin [\d.]+s.*$", output, re.M)
+    if not summaries:
+        return 0
+    counts = re.findall(r"(\d+) passed", summaries[-1])
+    return int(counts[0]) if counts else 0
 
 
 def build_builder_prompt(spec: str, tests: str) -> str:
@@ -77,6 +88,36 @@ def write_workspace(name: str, text: str) -> str:
     return path
 
 
+LOG_PATH = os.path.join(WORKSPACE, "log.md")
+
+
+def reset_log(request: str) -> None:
+    """Start a fresh log.md for this run."""
+    os.makedirs(WORKSPACE, exist_ok=True)
+    with open(LOG_PATH, "w", encoding="utf-8") as f:
+        f.write(f"# Run log\n\nRequest: {request}\n")
+
+
+def log_round(round_num: int, commit_id: str, passed: bool, score: int, sig: str, output: str) -> None:
+    """Append what happened this round: result, what changed since last round, the failure."""
+    fence = "`" * 3
+    status = "PASS" if passed else "FAIL"
+    lines = [
+        "",
+        f"## Round {round_num} ({commit_id}): {status}",
+        f"- tests passed: {score}",
+        f"- failure: {'none' if passed else sig}",
+        "- changed this round:",
+        fence,
+        changed_summary(),
+        fence,
+    ]
+    if not passed:
+        lines += ["- output (first 1500 chars):", fence, output.strip()[:1500], fence]
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def run(request: str) -> bool:
     """Plan, build, then check and fix for up to MAX_ROUNDS. True if the tests pass."""
     plan = call_role("planner", request)
@@ -86,37 +127,52 @@ def run(request: str) -> bool:
 
     code = first_block(call_role("builder", build_builder_prompt(spec, tests)), "python")
 
+    init_repo()
+    reset_log(request)
     sigs = []
+    last_commit = ""
     for round_num in range(1, MAX_ROUNDS + 1):
         write_workspace("solution.py", code)
         write_workspace("test_solution.py", tests)  # always the approved copy
 
         ruff_result = run_ruff(WORKSPACE)
         if ruff_result["passed"] is False:
+            passed, score = False, 0
             failure_output = ruff_result["output"]
             sig = ruff_signature(failure_output)
         else:
             pytest_result = run_pytest(WORKSPACE)
-            if pytest_result["passed"]:
-                print(f"Success: tests pass after {round_num} round(s).")
-                return True
+            passed = pytest_result["passed"]
             failure_output = pytest_result["output"]
-            sig = failure_signature(failure_output, pytest_result["timed_out"])
+            score = count_passed(failure_output)
+            sig = "PASS" if passed else failure_signature(failure_output, pytest_result["timed_out"])
+
+        last_commit = commit_round(round_num, score, sig)
+        log_round(round_num, last_commit, passed, score, sig, failure_output)
+
+        if passed:
+            print(f"Success: tests pass after {round_num} round(s).")
+            return True
 
         print(f"Round {round_num} failed: {sig}")
         sigs.append(sig)
         if len(sigs) >= 3 and len(set(sigs[-3:])) == 1:
             print(f"Stuck: same failure '{sig}' 3 times in a row. Stopping.")
-            return False
+            break
         if round_num == MAX_ROUNDS:
+            print(f"Out of rounds ({MAX_ROUNDS}). Last failure: {sigs[-1]}")
             break
 
         fix_reply = call_role("fixer", build_fixer_prompt(spec, tests, code, failure_output))
         code = first_block(fix_reply, "python")
 
-    print(f"Out of rounds ({MAX_ROUNDS}). Last failure: {sigs[-1]}")
+    best = best_round()
+    if best and best["id"] != last_commit:
+        rewind_to(best["id"])
+        print(f"Rewound workspace to round {best['round']} ({best['id']}), score {best['score']}.")
     return False
 
 
 if __name__ == "__main__":
     run(input("Enter your query : "))
+
