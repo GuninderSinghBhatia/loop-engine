@@ -4,6 +4,7 @@ Idle: typed text is a new project prompt. Running: typed text is steering.
 Slash commands become control signals sent to the engine.
 """
 
+import sys
 import threading
 
 from prompt_toolkit import PromptSession
@@ -12,6 +13,7 @@ from rich.console import Console
 from rich.markup import escape
 
 from loop_engine.control import ControlChannel
+from loop_engine.engine import Engine
 from loop_engine.events import Event
 from loop_engine.fake_engine import FakeEngine
 
@@ -26,6 +28,8 @@ STYLES = {
     "loop_done": "bold magenta",
     "approval_needed": "bold yellow",
     "step_skipped": "dim yellow",
+    "spec_written": "bold blue",
+    "rewound": "magenta",
     "error": "bold red",
 }
 
@@ -40,8 +44,9 @@ HELP = (
 
 
 class Session:
-    def __init__(self, console: Console, delay: float = 0.8) -> None:
+    def __init__(self, console: Console, fake: bool = False, delay: float = 0.8) -> None:
         self.console = console
+        self.fake = fake
         self.delay = delay
         self.channel = ControlChannel()
         self.thread: threading.Thread | None = None
@@ -65,11 +70,15 @@ class Session:
     def start_run(self, prompt: str) -> None:
         self.channel = ControlChannel()  # fresh channel: no leftovers from last run
         self.awaiting_approval = False
-        engine = FakeEngine(self.channel, delay=self.delay, ask_approval=lambda: self.approve)
+        ask = lambda: self.approve
+        if self.fake:
+            engine = FakeEngine(self.channel, delay=self.delay, ask_approval=ask)
+        else:
+            engine = Engine(self.channel, ask_approval=ask)
         self.thread = threading.Thread(target=self._run, args=(engine, prompt), daemon=True)
         self.thread.start()
 
-    def _run(self, engine: FakeEngine, prompt: str) -> None:
+    def _run(self, engine: Engine | FakeEngine, prompt: str) -> None:
         try:
             for event in engine.run(prompt):
                 self.last_event = event
@@ -122,8 +131,10 @@ class Session:
 
 def main() -> None:
     console = Console()
-    console.print("[bold green]Loop Engine v2[/bold green]  (type /help)")
-    session = Session(console)
+    fake = "--fake" in sys.argv[1:]
+    mode = "  [dim](fake engine)[/dim]" if fake else ""
+    console.print(f"[bold green]Loop Engine v2[/bold green]{mode}  (type /help)")
+    session = Session(console, fake=fake)
     prompt = PromptSession()
     with patch_stdout():
         while not session.should_exit:

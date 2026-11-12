@@ -8,7 +8,7 @@ from loop_engine.cli import Session
 
 def make_session(delay=0.0):
     out = io.StringIO()
-    return Session(Console(file=out, width=100), delay=delay), out
+    return Session(Console(file=out, width=100), fake=True, delay=delay), out
 
 
 def test_idle_commands_say_nothing_is_running():

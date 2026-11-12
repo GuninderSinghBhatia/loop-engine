@@ -18,6 +18,7 @@ def run_pytest(workspace: str, timeout: int = 30):
             [sys.executable, "-m", "pytest", workspace, "-q"],
             capture_output=True,
             text=True,
+            check=False,
             timeout=timeout,
         )
         return {
@@ -40,6 +41,7 @@ def run_ruff(workspace: str, timeout: int = 10):
             [sys.executable, "-m", "ruff", "check", os.path.join(workspace, "solution.py"), "--no-respect-gitignore", "--select", "E9,F"],
             capture_output=True,
             text=True,
+            check=False,
             timeout=timeout,
         )
         return {
@@ -50,6 +52,7 @@ def run_ruff(workspace: str, timeout: int = 10):
     except subprocess.TimeoutExpired as e:
         partial = _as_text(e.stdout) + "\n" + _as_text(e.stderr)
         return {
+            "passed": False,
             "output": f"Timed out after {timeout}s.\nPartial output:\n{partial}",
             "timed_out": True,
         }

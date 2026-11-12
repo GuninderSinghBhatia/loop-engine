@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterator
 
 from loop_engine.control import ControlChannel
 from loop_engine.events import Event
+from loop_engine.steering import Steerable
 
 SCRIPT = [
     ("phase_started", "planning: writing the spec"),
@@ -22,16 +23,15 @@ SCRIPT = [
 NEEDS_APPROVAL = {"file_written", "command_run"}
 
 
-class FakeEngine:
+class FakeEngine(Steerable):
     def __init__(
         self,
         channel: ControlChannel,
         delay: float = 0.0,
         ask_approval: Callable[[], bool] = lambda: False,
     ) -> None:
-        self.channel = channel
+        super().__init__(channel, ask_approval)
         self.delay = delay
-        self.ask_approval = ask_approval  # asked at each step, so it can change mid-run
 
     def run(self, prompt: str) -> Iterator[Event]:
         for kind, text in SCRIPT:
@@ -50,41 +50,3 @@ class FakeEngine:
             time.sleep(self.delay)
             yield Event(kind=kind, text=text)
         yield Event(kind="loop_done", text="finished")
-
-    def _checkpoint(self) -> Iterator[Event]:
-        """Safe point between steps: read control signals. Returns True to stop."""
-        paused = False
-        while True:
-            msg = self.channel.receive()
-            if msg is None:
-                if not paused:
-                    return False
-                time.sleep(0.05)
-                continue
-            kind, payload = msg
-            if kind == "stop":
-                return True
-            if kind == "pause" and not paused:
-                paused = True
-                yield Event(kind="paused")
-            elif kind == "resume" and paused:
-                paused = False
-                yield Event(kind="resumed")
-            elif kind == "steer":
-                yield Event(kind="steer_received", text=payload or "")
-
-    def _await_approval(self, what: str) -> Iterator[Event]:
-        """Ask for approval and wait for the answer. Returns "yes", "no" or "stop"."""
-        yield Event(kind="approval_needed", text=what)
-        while True:
-            msg = self.channel.receive()
-            if msg is None:
-                time.sleep(0.05)
-                continue
-            kind, payload = msg
-            if kind == "approval":
-                return "yes" if payload == "yes" else "no"
-            if kind == "stop":
-                return "stop"
-            if kind == "steer":
-                yield Event(kind="steer_received", text=payload or "")
